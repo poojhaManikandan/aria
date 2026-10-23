@@ -16,6 +16,7 @@ import { MODEL_COST, MODEL_NAMES } from '@/lib/constants';
 import { bus } from './bus';
 import { isLowConfidence, runDecider } from './decider';
 import { groundParameters, isClarificationReply } from './grounding';
+import { findOrder } from './knowledge';
 import { runMainAgent } from './main-agent';
 import { GROUNDING_TOKEN, estimateExposure, seededJitter, sleep, toolInvocation } from './tools';
 
@@ -212,6 +213,31 @@ function composeClarificationMessage(
 }
 
 /**
+ * Demote an otherwise-grounded slot back to "missing" after a semantic
+ * validation failure (unknown order, SKU not on the order). Keeping the
+ * clarification exchange open is what lets the customer correct the value in
+ * the next turn without restating the whole refund request.
+ */
+function markGroundingMissing(
+  result: GroundingResult,
+  param: GroundingParam,
+): GroundingResult {
+  const checks = result.checks.map((check) =>
+    check.param === param
+      ? { ...check, present: false, source: undefined, confidence: 0 }
+      : check,
+  );
+  const missingChecks = checks.filter((check) => !check.present);
+
+  return {
+    approved: missingChecks.length === 0,
+    checks,
+    missing: missingChecks.map((check) => check.label),
+    missingParams: missingChecks.map((check) => check.param),
+  };
+}
+
+/**
  * Process a single customer turn through the three-layer architecture.
  */
 export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTrace; events: TelemetryEvent[] }> {
@@ -291,6 +317,24 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
     const groundingStart = Date.now();
     grounding = groundParameters(input.message, input.history);
 
+    // Semantic pre-check: grounding proves the customer *stated* the values,
+    // not that they exist. If the order/SKU cannot be matched, keep the
+    // exchange open and ask for a correction instead of failing in the tool.
+    let validationNote = '';
+    if (grounding.approved) {
+      const orderId = grounding.checks.find((c) => c.param === 'ORDER_ID')?.value ?? '';
+      const sku = grounding.checks.find((c) => c.param === 'ITEM_SKU')?.value ?? '';
+      const order = findOrder(orderId);
+
+      if (!order) {
+        grounding = markGroundingMissing(grounding, 'ORDER_ID');
+        validationNote = `I couldn't find an order matching **#${orderId}** — could you double-check the number?`;
+      } else if (!order.items.some((item) => item.sku.toUpperCase() === sku.toUpperCase())) {
+        grounding = markGroundingMissing(grounding, 'ITEM_SKU');
+        validationNote = `I found order **#${orderId}**, but I couldn't match **${sku}** to the items on it.`;
+      }
+    }
+
     emit(
       2,
       'GROUNDING_CHECK',
@@ -351,11 +395,12 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
         })
         .map((check) => ({ param: check.param, value: check.value as string }));
 
-      assistantMessage = composeClarificationMessage(grounding.missing, {
+      const body = composeClarificationMessage(grounding.missing, {
         reason: grounding.checks.find((c) => c.param === 'REASON')?.value,
         followUp: Boolean(previousClarification),
         newlyGrounded,
       });
+      assistantMessage = validationNote ? `${validationNote} ${body}` : body;
       return;
     }
 

@@ -205,70 +205,122 @@ export async function runMainAgent(ctx: MainAgentContext): Promise<MainAgentOutc
     const orderId = ctx.grounding.checks.find((c) => c.param === 'ORDER_ID')?.value ?? '';
     const sku = ctx.grounding.checks.find((c) => c.param === 'ITEM_SKU')?.value ?? '';
     const reason = ctx.grounding.checks.find((c) => c.param === 'REASON')?.value ?? 'customer request';
+    const lookupStart = Date.now();
     const order = await lookupOrder(orderId);
-    const orderTotal = order?.total ?? 0;
+    const lookupLatency = Date.now() - lookupStart;
 
-    ctx.emit({
-      layer: 3,
-      stage: 'POLICY_CHECK',
-      kind: 'guard',
-      level: orderTotal > POLICY.autoRefundCeilingUsd ? 'warn' : 'success',
-      title: 'Refund policy check',
-      message:
-        orderTotal > POLICY.autoRefundCeilingUsd
-          ? `Refund of ${money(orderTotal)} exceeds the ${money(POLICY.autoRefundCeilingUsd)} auto-approval ceiling — routing to a human.`
-          : `${money(orderTotal)} refund is inside the ${money(POLICY.autoRefundCeilingUsd)} auto-approval ceiling.`,
-      data: { orderTotal, ceiling: POLICY.autoRefundCeilingUsd },
-    });
-
-    if (orderTotal > POLICY.autoRefundCeilingUsd) {
-      const ticket = await createSupportTicket(`Refund over ceiling — #${orderId}`, reason);
-      tools.push(toolInvocation('create_support_ticket', { order_id: orderId, reason }, 'executed', 140, ticket));
+    if (!order) {
+      tools.push(
+        toolInvocation('lookup_order', { order_id: orderId }, 'executed', lookupLatency, null),
+      );
       ctx.emit({
         layer: 3,
-        stage: 'TOOL_CALL',
-        kind: 'tool',
+        stage: 'POLICY_CHECK',
+        kind: 'guard',
         level: 'warn',
-        title: 'Tool · create_support_ticket',
-        message: `${ticket.ticketId} created in ${ticket.queue}`,
-        data: { tool: 'create_support_ticket', args: { order_id: orderId } },
+        title: 'Order lookup failed',
+        message: `No order matches #${orderId} — asking the customer to confirm the number.`,
+        data: { orderId },
       });
       message =
-        `I can process this one for you, but because the refund total (${money(orderTotal)}) is above my ` +
-        `automatic approval limit of ${money(POLICY.autoRefundCeilingUsd)}, I've sent it to a senior agent ` +
-        `who can authorise it. Ticket **${ticket.ticketId}** is open now — they'll action it during ${ticket.eta}.`;
+        `I couldn't find an order matching **#${orderId}** in our ledger — could you double-check the number? ` +
+        `It usually looks like five digits (for example #99482). As soon as you share the right order, ` +
+        `I'll continue the refund for ${reason}.`;
     } else {
-      const toolStart = Date.now();
-      const refund = await executeRefund({ order_id: orderId, sku, reason }, ctx.authorisation);
-      const toolLatency = Date.now() - toolStart;
-
-      tools.push(
-        toolInvocation(
-          'execute_refund',
-          { order_id: orderId, sku, reason },
-          'executed',
-          toolLatency,
-          refund,
-        ),
-      );
+      const orderTotal = order.total;
 
       ctx.emit({
         layer: 3,
-        stage: 'TOOL_CALL',
-        kind: 'tool',
-        level: 'success',
-        title: 'Tool · execute_refund',
-        message: `${refund.transactionId} · ${money(refund.amount)} → ${refund.sku}`,
-        durationMs: toolLatency,
-        data: {
-          tool: 'execute_refund',
-          args: { order_id: orderId, sku },
-          transactionId: refund.transactionId,
-          amount: refund.amount,
-        },
+        stage: 'POLICY_CHECK',
+        kind: 'guard',
+        level: orderTotal > POLICY.autoRefundCeilingUsd ? 'warn' : 'success',
+        title: 'Refund policy check',
+        message:
+          orderTotal > POLICY.autoRefundCeilingUsd
+            ? `Refund of ${money(orderTotal)} exceeds the ${money(POLICY.autoRefundCeilingUsd)} auto-approval ceiling — routing to a human.`
+            : `${money(orderTotal)} refund is inside the ${money(POLICY.autoRefundCeilingUsd)} auto-approval ceiling.`,
+        data: { orderTotal, ceiling: POLICY.autoRefundCeilingUsd },
       });
 
-      message = composeRefundAnswer(refund, reason);
+      if (orderTotal > POLICY.autoRefundCeilingUsd) {
+        const ticket = await createSupportTicket(`Refund over ceiling — #${orderId}`, reason);
+        tools.push(toolInvocation('create_support_ticket', { order_id: orderId, reason }, 'executed', 140, ticket));
+        ctx.emit({
+          layer: 3,
+          stage: 'TOOL_CALL',
+          kind: 'tool',
+          level: 'warn',
+          title: 'Tool · create_support_ticket',
+          message: `${ticket.ticketId} created in ${ticket.queue}`,
+          data: { tool: 'create_support_ticket', args: { order_id: orderId } },
+        });
+        message =
+          `I can process this one for you, but because the refund total (${money(orderTotal)}) is above my ` +
+          `automatic approval limit of ${money(POLICY.autoRefundCeilingUsd)}, I've sent it to a senior agent ` +
+          `who can authorise it. Ticket **${ticket.ticketId}** is open now — they'll action it during ${ticket.eta}.`;
+      } else {
+        const line = order.items.find(
+          (item) => item.sku.toUpperCase() === sku.toUpperCase(),
+        );
+
+        if (!line) {
+          tools.push(
+            toolInvocation(
+              'execute_refund',
+              { order_id: orderId, sku, reason },
+              'skipped',
+              0,
+              undefined,
+              `SKU ${sku} is not present on order ${orderId}`,
+            ),
+          );
+          ctx.emit({
+            layer: 3,
+            stage: 'POLICY_CHECK',
+            kind: 'guard',
+            level: 'warn',
+            title: 'Item not on order',
+            message: `Order #${orderId} does not contain ${sku} — asking the customer to confirm the SKU.`,
+            data: { orderId, sku },
+          });
+          message =
+            `I found order **#${orderId}**, but I couldn't match **${sku}** to the items on that order. ` +
+            `Could you confirm the SKU exactly as it appears on your order confirmation ` +
+            `(for example SHOE-BLU-01)? No refund has been issued yet.`;
+        } else {
+          const toolStart = Date.now();
+          const refund = await executeRefund({ order_id: orderId, sku, reason }, ctx.authorisation);
+          const toolLatency = Date.now() - toolStart;
+
+          tools.push(
+            toolInvocation(
+              'execute_refund',
+              { order_id: orderId, sku, reason },
+              'executed',
+              toolLatency,
+              refund,
+            ),
+          );
+
+          ctx.emit({
+            layer: 3,
+            stage: 'TOOL_CALL',
+            kind: 'tool',
+            level: 'success',
+            title: 'Tool · execute_refund',
+            message: `${refund.transactionId} · ${money(refund.amount)} → ${refund.sku}`,
+            durationMs: toolLatency,
+            data: {
+              tool: 'execute_refund',
+              args: { order_id: orderId, sku },
+              transactionId: refund.transactionId,
+              amount: refund.amount,
+            },
+          });
+
+          message = composeRefundAnswer(refund, reason);
+        }
+      }
     }
   } else {
     /* -------------------- escalation route ------------------------ */

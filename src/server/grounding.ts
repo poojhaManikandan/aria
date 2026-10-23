@@ -87,7 +87,9 @@ export function extractOrderId(text: string): string | null {
   const candidates: string[] = [];
 
   // "order #99482", "order id 99482", "order number: 99482", "order 99482"
-  const explicit = /\borders?\s*(?:id\s*|no\.?\s*|number\s*|#)?\s*[:#]?\s*([a-z0-9][a-z0-9-]{2,})\b/gi;
+  // Customers also call the order reference their "product" or "item" number.
+  const explicit =
+    /\b(?:orders?|products?|items?|purchases?|invoices?|references?|refs?)\s*(?:id\s*|no\.?\s*|number\s*|#)?\s*[:#]?\s*([a-z0-9][a-z0-9-]{2,})\b/gi;
   for (const match of text.matchAll(explicit)) {
     candidates.push(match[1]);
   }
@@ -215,13 +217,18 @@ const NON_ANSWER_FEATURES = new Set([
 ]);
 
 /**
- * Does this turn answer a clarification question the agent asked?
+ * Does this turn belong to the clarification exchange the agent opened?
  *
- * A reply such as "10231" or "the white sneakers" carries almost no
- * linguistic signal, so the 2B classifier alone cannot tell whether it is a
- * continuation of a refund request or a fresh question. The conversation
- * context can: if the previous assistant turn asked for a slot and this
- * message supplies one of them, the customer is answering us.
+ * A reply such as "10231", "the white sneakers" or "the product was shoes"
+ * carries almost no linguistic signal, so the 2B classifier alone cannot tell
+ * whether it continues a refund request or starts a fresh question. The
+ * conversation context can: while the last assistant turn is still asking for
+ * missing slots, a reply is part of that exchange unless it clearly switches
+ * intent (tracking, pricing, a human, a complaint, …).
+ *
+ * Being permissive here is essential: free-form answers must never be
+ * re-routed as a brand-new request, because that would discard the slots that
+ * were already grounded and ask the customer for them all over again.
  *
  * @param message       The customer's newest utterance.
  * @param history       Prior turns (oldest → newest).
@@ -239,28 +246,10 @@ export function isClarificationReply(
   // The customer is clearly doing something else.
   if (attributions.some((a) => NON_ANSWER_FEATURES.has(a.feature))) return false;
 
-  // A descriptive answer ("it was broken when it arrived") is just as valid
-  // a clarification reply as a bare SKU. The customer may volunteer the reason
-  // while we were waiting for another slot — that must continue the refund
-  // workflow instead of falling through to a fresh (and context-less) request.
-  if (extractReason(message)) return true;
-
-  return requested.some((param) => {
-    switch (param) {
-      case 'ORDER_ID':
-        return Boolean(extractOrderId(message) ?? extractBareOrderId(message));
-      case 'ITEM_SKU':
-        return Boolean(
-          extractExplicitSku(message) ??
-            resolveProductToSku(message)?.sku ??
-            extractSkuShapedToken(message),
-        );
-      case 'REASON':
-        return Boolean(extractReason(message));
-      default:
-        return false;
-    }
-  });
+  // Any other reply continues the open clarification exchange. Grounding will
+  // re-evaluate every slot from the accumulated history, and the deterministic
+  // clarification copy will ask only for what is still missing.
+  return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -477,7 +466,20 @@ export function groundParameters(userMessage: string, history: ChatMessage[]): G
   const orderId = resolveSlot('ORDER_ID', userMessage, scope, {
     strict: (text) => {
       const value = extractOrderId(text);
-      return value ? { value, source: 'current_message' } : null;
+      if (value) return { value, source: 'current_message' };
+
+      // A standalone 4+ digit reference inside a refund/defect message is the
+      // order number, even when the customer describes it as "my product
+      // 12345" rather than "order #12345". Money amounts are stripped first.
+      const refundContext = /\b(?:refund|return|reimburse|broken|damaged|defective|faulty)\b/i.test(
+        text,
+      );
+      if (refundContext) {
+        const bare = extractBareOrderId(text);
+        if (bare) return { value: bare, source: 'current_message' };
+      }
+
+      return null;
     },
     // A bare "10231" is only read as an order id when we asked for one.
     shorthand: (text) => {
