@@ -61,6 +61,13 @@ export interface DeciderDecision {
 
 export type GroundingParam = 'ORDER_ID' | 'ITEM_SKU' | 'REASON';
 
+/**
+ * A candidate is a value we extracted from the customer's words. It only
+ * becomes `validated` after Layer 2 has checked it against the application's
+ * order/catalog schema. Missing slots never reach tool execution.
+ */
+export type GroundingStatus = 'missing' | 'candidate' | 'validated';
+
 export interface GroundingCheck {
   param: GroundingParam;
   /** Human readable name, e.g. "Order ID". */
@@ -72,6 +79,8 @@ export interface GroundingCheck {
   source?: 'current_message' | 'chat_context' | 'catalog' | 'policy';
   /** 0..1 — how strongly the parameter was grounded. */
   confidence: number;
+  /** Extraction/validation status — distinct from mere presence. */
+  status: GroundingStatus;
 }
 
 export interface GroundingResult {
@@ -82,6 +91,41 @@ export interface GroundingResult {
   missing: string[];
   /** Machine names of the missing parameters (used to scope chat-context grounding). */
   missingParams: GroundingParam[];
+}
+
+/* ------------------------------------------------------------------ */
+/* Workflow state machine                                              */
+/* ------------------------------------------------------------------ */
+
+export type WorkflowState =
+  | 'REQUEST_RECEIVED'
+  | 'CLASSIFIED'
+  | 'PARAMETERS_EXTRACTED'
+  | 'PARAMETERS_VALIDATED'
+  | 'AWAITING_CLARIFICATION'
+  | 'READY_TO_EXECUTE'
+  | 'EXECUTED'
+  | 'ESCALATED'
+  | 'BLOCKED';
+
+export interface ClarificationTrace {
+  /** Number of clarification questions already asked in this exchange. */
+  attempt: number;
+  /** Hard upper bound on clarification rounds before human hand-off. */
+  maxAttempts: number;
+  /** Slots requested across the open clarification exchange. */
+  requested: GroundingParam[];
+  /** Slots already resolved when the last question was asked. */
+  resolved: Partial<Record<GroundingParam, string>>;
+  /** True when the retry limit was reached and the exchange was closed. */
+  exhausted: boolean;
+}
+
+export interface WorkflowTrace {
+  state: WorkflowState;
+  clarification: ClarificationTrace;
+  /** True when this turn started a new refund request instead of answering one. */
+  freshRequest: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -120,6 +164,8 @@ export interface TelemetryEvent {
   id: string;
   /** Groups every event belonging to one customer turn. */
   traceId: string;
+  /** Client scenario/session id — stale sessions are ignored by the UI. */
+  sessionId?: string;
   /** Monotonic sequence number within the session. */
   seq: number;
   /** Epoch milliseconds. */
@@ -179,6 +225,7 @@ export interface PipelineTrace {
   userMessage: string;
   decision: DeciderDecision;
   grounding: GroundingResult;
+  workflow: WorkflowTrace;
   guardrail: GuardrailState;
   action: PipelineAction;
   /** Wall-clock latency of the main agent turn, 0 when never invoked. */
@@ -212,7 +259,12 @@ export interface ChatResponse {
 /* ------------------------------------------------------------------ */
 
 export interface SessionMetrics {
+  /** Customer turns processed — one per submitted message. */
   turns: number;
+  /** Layer-3 invocations, counted separately from customer turns. */
+  agentInvocations: number;
+  /** Turns that ended in a deterministic clarification question. */
+  clarifications: number;
   blocked: number;
   escalated: number;
   grounded: number;

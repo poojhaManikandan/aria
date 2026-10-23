@@ -24,7 +24,8 @@ import TelemetryPanel from './TelemetryPanel';
  * Mobile:  a tab bar switches between the two panes.
  */
 export default function AgentConsole() {
-  const { messages, events, live, metrics, connected, busy, error, send, reset } = useAgentConsole();
+  const { messages, events, live, metrics, connected, busy, error, send, startScenario, reset } =
+    useAgentConsole();
   const [mobileTab, setMobileTab] = useState<'chat' | 'telemetry'>('chat');
 
   return (
@@ -157,6 +158,7 @@ export default function AgentConsole() {
               live={live}
               error={error}
               onSend={send}
+              onScenario={startScenario}
             />
           </div>
 

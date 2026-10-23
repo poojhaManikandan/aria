@@ -104,8 +104,9 @@ export default function TelemetryPanel({
         </div>
 
         {/* Session strip */}
-        <div className="mt-3 grid grid-cols-5 gap-2 rounded-xl border border-slate-800/80 bg-slate-950/40 px-3 py-2">
-          <SessionStat label="Turns" value={int(metrics.turns)} />
+        <div className="mt-3 grid grid-cols-3 gap-2 rounded-xl border border-slate-800/80 bg-slate-950/40 px-3 py-2 sm:grid-cols-6">
+          <SessionStat label="User turns" value={int(metrics.turns)} />
+          <SessionStat label="Agent runs" value={int(metrics.agentInvocations)} />
           <SessionStat label="Blocked" value={int(metrics.blocked)} />
           <SessionStat
             label="Decider avg"

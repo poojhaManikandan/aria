@@ -216,6 +216,8 @@ export function deriveLiveState(events: TelemetryEvent[]): LiveState {
 export function aggregateMetrics(traces: PipelineTrace[]): SessionMetrics {
   const metrics: SessionMetrics = {
     turns: traces.length,
+    agentInvocations: 0,
+    clarifications: 0,
     blocked: 0,
     escalated: 0,
     grounded: 0,
@@ -238,6 +240,8 @@ export function aggregateMetrics(traces: PipelineTrace[]): SessionMetrics {
   let baselineTotal = 0;
 
   for (const trace of traces) {
+    if (trace.mainAgentInvoked) metrics.agentInvocations += 1;
+    if (trace.action === 'CLARIFY_GROUNDING') metrics.clarifications += 1;
     if (trace.decision.label === 'POTENTIAL_FRAUD_ABUSE') metrics.blocked += 1;
     if (trace.action === 'ESCALATED_TO_HUMAN') metrics.escalated += 1;
     if (trace.action === 'CLARIFY_GROUNDING') metrics.ungrounded += 1;

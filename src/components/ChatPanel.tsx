@@ -18,6 +18,7 @@ interface ChatPanelProps {
   live: LiveState;
   error: string | null;
   onSend: (text: string) => void;
+  onScenario: (text: string) => void | Promise<void>;
 }
 
 /** Human-readable copy for the live pipeline stage. */
@@ -27,8 +28,14 @@ const STAGE_COPY: Record<string, string> = {
   DECIDER_START: 'Layer 1 · running policy classification',
   DECIDER_RESULT: 'Layer 1 · classification complete',
   LOW_CONFIDENCE: 'Layer 1 · low confidence — failing safe',
+  PARAMETERS_EXTRACTED: 'Layer 2 · extracting tool parameters',
+  PARAMETERS_VALIDATED: 'Layer 2 · validating tool parameters',
   GROUNDING_CHECK: 'Layer 2 · grounding tool parameters',
   CLARIFICATION_REPLY: 'Layer 1 · recognising your answer',
+  CLARIFICATION_RESET: 'Layer 1 · starting a fresh refund request',
+  CLARIFICATION_LIMIT: 'Layer 2 · clarification limit reached',
+  AWAITING_CLARIFICATION: 'Layer 2 · waiting for missing details',
+  READY_TO_EXECUTE: 'Layer 2 · approved — handing off to Layer 3',
   TOOL_HELD: 'Layer 2 · holding tool back',
   TOOL_FROZEN: 'Layer 1 · freezing tool execution',
   GUARDRAIL_BLOCK: 'Layer 1 · intercepting request',
@@ -40,7 +47,14 @@ const STAGE_COPY: Record<string, string> = {
   TURN_COMPLETE: 'Turn complete',
 };
 
-export default function ChatPanel({ messages, busy, live, error, onSend }: ChatPanelProps) {
+export default function ChatPanel({
+  messages,
+  busy,
+  live,
+  error,
+  onSend,
+  onScenario,
+}: ChatPanelProps) {
   const [input, setInput] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -58,11 +72,15 @@ export default function ChatPanel({ messages, busy, live, error, onSend }: ChatP
     onSend(text);
   };
 
-  /** Scenario buttons pre-fill the composer, then fire the turn. */
+  /**
+   * Scenario buttons start a clean test conversation and submit exactly once.
+   * There is deliberately no timer: a timer allowed two rapid clicks to queue
+   * two sends before React re-rendered the disabled state.
+   */
   const runScenario = (message: string) => {
     if (busy) return;
-    setInput(message);
-    window.setTimeout(() => submit(message), 160);
+    setInput('');
+    void onScenario(message);
   };
 
   const stageCopy = STAGE_COPY[live.stage] ?? live.stage;

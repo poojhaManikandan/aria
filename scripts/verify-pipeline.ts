@@ -252,6 +252,7 @@ async function layer3ResilienceChecks() {
         value: '99482',
         source: 'current_message',
         confidence: 1,
+        status: 'validated',
       },
       {
         param: 'ITEM_SKU',
@@ -260,6 +261,7 @@ async function layer3ResilienceChecks() {
         value: 'SHOE-BLU-01',
         source: 'current_message',
         confidence: 1,
+        status: 'validated',
       },
       {
         param: 'REASON',
@@ -268,6 +270,7 @@ async function layer3ResilienceChecks() {
         value: 'damaged',
         source: 'current_message',
         confidence: 1,
+        status: 'validated',
       },
     ],
     missing: [],

@@ -124,7 +124,9 @@ all mocked in-process.
 
 ## Judge script
 
-Click a scenario card in the chat composer, or send the text yourself.
+Click a scenario card in the chat composer, or send the text yourself. Each card starts a clean
+test conversation, so a half-finished clarification from a previous click can never leak into the
+next scenario.
 
 ### A · Safe request — `SAFE_INFO_REQUEST`
 > Hi, where is my order #99482? I bought the blue shoes.
@@ -151,14 +153,15 @@ This holds **even after running Scenario A first**. Chat-context grounding is sc
 agent explicitly asked for in its previous turn, so `#99482` and "blue shoes" can never leak into
 this new request. Reply with *“It's order #10231, the white sneakers arrived damaged”* and the
 parameters ground against the order the customer just named, the refund executes, and the guardrail
-flips to GREEN. (`npm run verify` proves all three cases.)
+flips to GREEN. Clarification is capped at **3 rounds**; repeated non-answers close the exchange
+and hand off to a human instead of looping forever. (`npm run verify` proves all of this.)
 
 ---
 
 ## Verification
 
 ```bash
-npm run verify       # 11 classifier cases + all 3 pipeline scenarios
+npm run verify       # classifier + pipeline + Scenario C acceptance suites
 npm run typecheck
 npm run lint
 ```
@@ -167,6 +170,8 @@ npm run lint
 scenarios plus injection, bulk-abuse, escalation and benign edge cases.
 `scripts/verify-pipeline.ts` asserts the full trace contract (label, guardrail, main-agent invocation,
 tool status, cost, exposure).
+`scripts/verify-scenario-c.ts` covers exact multi-slot replies, invalid SKUs, the bounded retry
+policy, scenario isolation, telemetry session scoping and same-tick duplicate submission.
 
 ---
 

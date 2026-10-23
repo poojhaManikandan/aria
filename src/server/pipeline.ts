@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type {
   ChatMessage,
+  ClarificationTrace,
   DecisionLabel,
   GroundingParam,
   GroundingResult,
@@ -11,14 +12,16 @@ import type {
   TelemetryKind,
   TelemetryLevel,
   ToolInvocation,
+  WorkflowState,
 } from '@/lib/types';
 import { MODEL_COST, MODEL_NAMES } from '@/lib/constants';
 import { bus } from './bus';
 import { isLowConfidence, runDecider } from './decider';
-import { groundParameters, isClarificationReply } from './grounding';
+import { groundParameters, isClarificationReply, isFreshRefundRequest } from './grounding';
 import { resolveOrder } from './knowledge';
 import { MAIN_AGENT_FALLBACK_MESSAGE, runMainAgent } from './main-agent';
 import { GROUNDING_TOKEN, estimateExposure, seededJitter, sleep, toolInvocation } from './tools';
+import { finalWorkflowState, getClarificationTrace } from './workflow';
 
 /**
  * ─────────────────────────────────────────────────────────────────────────
@@ -36,10 +39,12 @@ import { GROUNDING_TOKEN, estimateExposure, seededJitter, sleep, toolInvocation 
 export interface TurnInput {
   message: string;
   history: ChatMessage[];
+  /** Client scenario/session id, used to reject stale UI responses/events. */
+  sessionId?: string;
 }
 
 /** Local emitter bound to a single trace. */
-function createEmitter(traceId: string) {
+function createEmitter(traceId: string, sessionId?: string) {
   const events: TelemetryEvent[] = [];
   return {
     events,
@@ -55,6 +60,7 @@ function createEmitter(traceId: string) {
       const event: TelemetryEvent = {
         id: randomUUID(),
         traceId,
+        sessionId,
         seq: bus.nextSeq(),
         ts: Date.now(),
         layer,
@@ -259,7 +265,7 @@ function markGroundingMissing(
 ): GroundingResult {
   const checks = result.checks.map((check) =>
     check.param === param
-      ? { ...check, present: false, source: undefined, confidence: 0 }
+      ? { ...check, present: false, source: undefined, confidence: 0, status: 'missing' as const }
       : check,
   );
   const missingChecks = checks.filter((check) => !check.present);
@@ -277,14 +283,23 @@ function markGroundingMissing(
  */
 export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTrace; events: TelemetryEvent[] }> {
   const traceId = randomUUID();
-  const { events, emit } = createEmitter(traceId);
+  const { events, emit } = createEmitter(traceId, input.sessionId);
   const started = Date.now();
+  const clarification = getClarificationTrace(input.history);
+  const freshRequest = isFreshRefundRequest(input.message, input.history);
+  let workflowState: WorkflowState = 'REQUEST_RECEIVED';
 
   /* ---------------------------------------------------------------- */
   /* Pre-flight                                                       */
   /* ---------------------------------------------------------------- */
   emit(0, 'TURN_RECEIVED', 'log', 'info', 'Turn received', input.message.slice(0, 120), {
-    data: { chars: input.message.length, historyTurns: input.history.length },
+    data: {
+      chars: input.message.length,
+      historyTurns: input.history.length,
+      sessionId: input.sessionId,
+      workflowState,
+      clarificationAttempt: clarification.attempt,
+    },
   });
 
   /* ---------------------------------------------------------------- */
@@ -297,6 +312,7 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
 
   await sleep(deciderLatency);
   const decision = runDecider(input.message, deciderLatency);
+  workflowState = 'CLASSIFIED';
 
   emit(
     1,
@@ -314,6 +330,7 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
         attributions: decision.attributions,
         inputTokens: decision.inputTokens,
         costUsd: decision.costUsd,
+        workflowState,
       },
     },
   );
@@ -344,28 +361,109 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
     decision.attributions,
   );
 
+  if (freshRequest) {
+    emit(
+      1,
+      'CLARIFICATION_RESET',
+      'decision',
+      'info',
+      'New refund request',
+      'A fresh refund request restarted the workflow — previous clarification slots were not carried over.',
+      {
+        data: {
+          workflowState,
+          discardedAttempts: clarification.attempt,
+        },
+      },
+    );
+  }
+
   /**
    * Layer 2 — the tool-parameter grounding gate, followed by either the
    * deterministic clarification question or the Layer 3 refund workflow.
    */
   async function runGroundedTurn(): Promise<void> {
     const groundingStart = Date.now();
-    grounding = groundParameters(input.message, input.history);
+    grounding = groundParameters(input.message, input.history, {
+      ignoreClarificationContext: freshRequest,
+    });
+    workflowState = 'PARAMETERS_EXTRACTED';
+
+    const presentParams = grounding.checks.filter((c) => c.present).map((c) => c.param);
+    emit(
+      2,
+      'PARAMETERS_EXTRACTED',
+      'guard',
+      'info',
+      'Parameters extracted',
+      presentParams.length
+        ? `Candidate parameters extracted: ${presentParams.join(', ')}. Missing: ${
+            grounding.missingParams.join(', ') || 'none'
+          }.`
+        : `No candidate parameters found. Missing: ${grounding.missingParams.join(', ')}.`,
+      {
+        data: {
+          workflowState,
+          presentParams,
+          missingParams: grounding.missingParams,
+        },
+      },
+    );
 
     // Semantic pre-check: grounding proves the customer *stated* the values,
-    // not that they exist. If the order/SKU cannot be matched, keep the
-    // exchange open and ask for a correction instead of failing in the tool.
+    // not that they exist. Validate the order/SKU pair against the schema even
+    // when another slot (e.g. reason) is still missing, so the customer is
+    // asked only for the field that is actually invalid.
     let validationNote = '';
-    if (grounding.approved) {
-      const orderId = grounding.checks.find((c) => c.param === 'ORDER_ID')?.value ?? '';
-      const sku = grounding.checks.find((c) => c.param === 'ITEM_SKU')?.value ?? '';
-      const order = resolveOrder(orderId, sku);
+    const orderIdCheck = grounding.checks.find((c) => c.param === 'ORDER_ID');
+    const skuCheck = grounding.checks.find((c) => c.param === 'ITEM_SKU');
 
-      if (!order.items.some((item) => item.sku.toUpperCase() === sku.toUpperCase())) {
+    if (orderIdCheck?.present && orderIdCheck.value && skuCheck?.present && skuCheck.value) {
+      const order = resolveOrder(orderIdCheck.value, skuCheck.value);
+
+      if (!order.items.some((item) => item.sku.toUpperCase() === skuCheck.value!.toUpperCase())) {
         grounding = markGroundingMissing(grounding, 'ITEM_SKU');
-        validationNote = `I found order **#${orderId}**, but I couldn't match **${sku}** to the items on it.`;
+        validationNote = `I found order **#${orderIdCheck.value}**, but I couldn't match **${skuCheck.value}** to the items on it.`;
       }
     }
+
+    // A present value is a candidate until the whole required set validates.
+    // This keeps "extracted" separate from "grounded and authorised".
+    grounding = {
+      ...grounding,
+      checks: grounding.checks.map((check) => ({
+        ...check,
+        status: check.present ? (grounding.approved ? 'validated' : 'candidate') : 'missing',
+      })),
+    };
+    workflowState = 'PARAMETERS_VALIDATED';
+    const currentPresentParams = grounding.checks
+      .filter((check) => check.present)
+      .map((check) => check.param);
+
+    emit(
+      2,
+      'PARAMETERS_VALIDATED',
+      'guard',
+      grounding.approved ? 'success' : 'warn',
+      grounding.approved ? 'Parameters validated' : 'Parameter validation incomplete',
+      grounding.approved
+        ? 'Every required parameter is explicitly grounded and schema-validated.'
+        : `Validated candidates: ${currentPresentParams.join(', ') || 'none'}. Missing/invalid: ${
+            grounding.missingParams.join(', ') || 'none'
+          }.`,
+      {
+        data: {
+          workflowState,
+          statuses: grounding.checks.map((check) => ({
+            param: check.param,
+            status: check.status,
+          })),
+          missingParams: grounding.missingParams,
+          approved: grounding.approved,
+        },
+      },
+    );
 
     emit(
       2,
@@ -381,6 +479,7 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
       {
         durationMs: Date.now() - groundingStart,
         data: {
+          workflowState,
           checks: grounding.checks,
           missing: grounding.missing,
           approved: grounding.approved,
@@ -390,7 +489,6 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
 
     if (!grounding.approved) {
       guardrail = 'AMBER';
-      action = 'CLARIFY_GROUNDING';
       const attempted = {
         order_id: grounding.checks.find((c) => c.param === 'ORDER_ID')?.value ?? null,
         sku: grounding.checks.find((c) => c.param === 'ITEM_SKU')?.value ?? null,
@@ -415,10 +513,56 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
           `Grounding incomplete — missing ${grounding.missing.join(', ')}`,
         ),
       );
-      const previousClarification = lastClarificationTurn(input.history);
+
+      const alreadyAsked = freshRequest ? 0 : clarification.attempt;
+
+      // Bounded clarification policy: never ask the same question forever.
+      // Once the limit is reached the exchange closes and a human takes over.
+      if (alreadyAsked >= clarification.maxAttempts) {
+        action = 'ESCALATED_TO_HUMAN';
+        workflowState = 'ESCALATED';
+        emit(
+          2,
+          'CLARIFICATION_LIMIT',
+          'guard',
+          'error',
+          'Clarification limit reached',
+          `Asked ${alreadyAsked} time(s) for ${grounding.missingParams.join(
+            ', ',
+          )} without success — closing the exchange and escalating to a human. No refund was issued.`,
+          {
+            data: {
+              workflowState,
+              attempt: alreadyAsked,
+              maxAttempts: clarification.maxAttempts,
+              missingParams: grounding.missingParams,
+            },
+          },
+        );
+
+        const outcome = await runMainAgentSafely({
+          label: 'HUMAN_ESCALATION',
+          userMessage: input.message,
+          grounding,
+          authorisation: null,
+          emit: (event) => emit(event.layer, event.stage, event.kind, event.level, event.title, event.message, event),
+        });
+        assistantMessage = validationNote
+          ? `${validationNote} ${outcome.message}`
+          : outcome.message;
+        tools.push(...outcome.tools);
+        mainAgentInvoked = true;
+        mainAgentLatencyMs = outcome.latencyMs;
+        mainAgentCost = outcome.costUsd;
+        return;
+      }
+
+      action = 'CLARIFY_GROUNDING';
+      workflowState = 'AWAITING_CLARIFICATION';
+      const previousClarification = freshRequest ? null : lastClarificationTurn(input.history);
       const newlyGrounded = grounding.checks
         .filter((check) => {
-          if (!check.present || !check.value) return false;
+          if (!check.present || !check.value || check.status !== 'candidate') return false;
           if (check.source !== 'current_message' && check.source !== 'catalog') return false;
           const previous = previousClarification?.resolved?.[check.param];
           return (
@@ -433,11 +577,39 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
         newlyGrounded,
       });
       assistantMessage = validationNote ? `${validationNote} ${body}` : body;
+
+      const requested = [...new Set([...clarification.requested, ...grounding.missingParams])];
+      emit(
+        2,
+        'AWAITING_CLARIFICATION',
+        'guard',
+        'warn',
+        'Awaiting clarification',
+        `Clarification ${alreadyAsked + 1} of ${clarification.maxAttempts}. Missing: ${grounding.missingParams.join(
+          ', ',
+        )}. No refund was issued.`,
+        {
+          data: {
+            workflowState,
+            attempt: alreadyAsked + 1,
+            maxAttempts: clarification.maxAttempts,
+            missingParams: grounding.missingParams,
+            requestedParams: requested,
+          },
+        },
+      );
       return;
     }
 
     guardrail = 'GREEN';
     action = 'PROCEED_TO_MAIN_AGENT';
+    workflowState = 'READY_TO_EXECUTE';
+    emit(2, 'READY_TO_EXECUTE', 'guard', 'success', 'Ready to execute', 'All required parameters validated — handing off to Layer 3.', {
+      data: {
+        workflowState,
+        params: grounding.checks.map((check) => check.param),
+      },
+    });
     const outcome = await runMainAgentSafely({
       label: 'VALID_RETURN_REQUEST',
       userMessage: input.message,
@@ -456,6 +628,7 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
   if (decision.label === 'POTENTIAL_FRAUD_ABUSE') {
     guardrail = 'RED';
     action = 'BLOCKED_BY_GUARDRAIL';
+    workflowState = 'BLOCKED';
     preventedExposureUsd = estimateExposure(input.message);
     const attemptedOrder = input.message.match(/\b(?:order|#)\s*#?(\d{3,})\b/i)?.[1] ?? null;
 
@@ -468,6 +641,7 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
       'Prompt-injection / abuse signature detected — request terminated at Layer 1',
       {
         data: {
+          workflowState,
           attackSignals: decision.attributions.map((a) => a.feature),
           attemptedOrder,
           preventedExposureUsd,
@@ -534,6 +708,7 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
     }
     guardrail = 'AMBER';
     action = 'ESCALATED_TO_HUMAN';
+    workflowState = 'ESCALATED';
     const outcome = await runMainAgentSafely({
       label: 'HUMAN_ESCALATION',
       userMessage: input.message,
@@ -553,6 +728,7 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
     /* ---------- SAFE INFO REQUEST (fast path) ---------- */
     guardrail = 'GREEN';
     action = 'PROCEED_TO_MAIN_AGENT';
+    workflowState = 'READY_TO_EXECUTE';
     if (isLowConfidence(decision)) {
       emit(
         1,
@@ -588,6 +764,38 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
   const costSavedUsd = Math.max(0, baselineCostUsd - costSpentUsd);
   const costSavedPct = baselineCostUsd > 0 ? costSavedUsd / baselineCostUsd : 0;
   const totalLatencyMs = Date.now() - started;
+  const refundExecuted = tools.some(
+    (tool) => tool.name === 'execute_refund' && tool.status === 'executed',
+  );
+  const ticketCreated = tools.some(
+    (tool) => tool.name === 'create_support_ticket' && tool.status === 'executed',
+  );
+  workflowState = finalWorkflowState(action, refundExecuted, ticketCreated);
+
+  const askedThisTurn = workflowState === 'AWAITING_CLARIFICATION';
+  const previousAttempts = freshRequest ? 0 : clarification.attempt;
+  const resolvedThisTurn: Partial<Record<GroundingParam, string>> = {};
+  for (const check of grounding.checks) {
+    if (check.present && check.value) resolvedThisTurn[check.param] = check.value;
+  }
+  const clarificationTrace: ClarificationTrace = {
+    attempt: previousAttempts + (askedThisTurn ? 1 : 0),
+    maxAttempts: clarification.maxAttempts,
+    requested: askedThisTurn
+      ? [
+          ...new Set(
+            freshRequest
+              ? grounding.missingParams
+              : [...clarification.requested, ...grounding.missingParams],
+          ),
+        ]
+      : clarification.requested,
+    resolved: askedThisTurn
+      ? { ...(freshRequest ? {} : clarification.resolved), ...resolvedThisTurn }
+      : clarification.resolved,
+    exhausted:
+      action === 'ESCALATED_TO_HUMAN' && grounding.missingParams.length > 0,
+  };
 
   emit(
     0,
@@ -602,6 +810,9 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
         label: decision.label,
         action,
         guardrail,
+        workflowState,
+        clarificationAttempt: clarificationTrace.attempt,
+        freshRequest,
         deciderLatencyMs: decision.latencyMs,
         mainAgentLatencyMs,
         mainAgentInvoked,
@@ -619,6 +830,11 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
       userMessage: input.message,
       decision,
       grounding,
+      workflow: {
+        state: workflowState,
+        clarification: clarificationTrace,
+        freshRequest,
+      },
       guardrail,
       action,
       mainAgentLatencyMs,

@@ -341,9 +341,49 @@ export function isClarificationReply(
   // The customer is clearly doing something else.
   if (attributions.some((a) => NON_ANSWER_FEATURES.has(a.feature))) return false;
 
+  // A complete new refund request restarts the workflow. Without this check a
+  // canned scenario re-run (or a customer restating the issue) could be read as
+  // an answer to the previous question and inherit its resolved order/SKU.
+  if (isFreshRefundRequest(message, history)) return false;
+
   // Any other reply continues the open clarification exchange. Grounding will
   // re-evaluate every slot from the accumulated history, and the deterministic
   // clarification copy will ask only for what is still missing.
+  return true;
+}
+
+/**
+ * Does this message start a new refund request while a clarification exchange
+ * is still open?
+ *
+ * A new request has refund/return intent AND does not supply a value for any of
+ * the slots the agent is currently waiting on. A reply such as
+ * "order 10231, it arrived damaged" carries values and therefore remains part
+ * of the exchange; a restatement like "I want a refund for my damaged item
+ * please" does not, so its previous slots must not be carried over.
+ */
+export function isFreshRefundRequest(message: string, history: ChatMessage[]): boolean {
+  const lastAssistant = [...history].reverse().find((m) => m.role === 'assistant');
+  const requested = lastAssistant?.requests ?? [];
+  if (!requested.length) return false;
+
+  if (!/\b(?:refund|reimburse|reimbursement|money back|return|exchange)\b/i.test(message)) {
+    return false;
+  }
+
+  for (const param of requested) {
+    if (param === 'ORDER_ID') {
+      if (extractOrderId(message)) return false;
+      if (extractBareOrderId(stripSkuReferences(message))) return false;
+    }
+    if (param === 'ITEM_SKU') {
+      if (extractExplicitSku(message)) return false;
+      if (extractSkuShapedToken(message)) return false;
+      if (extractBareSku(message)) return false;
+    }
+    if (param === 'REASON' && extractReason(message)) return false;
+  }
+
   return true;
 }
 
@@ -557,8 +597,23 @@ function normaliseHistory(history: ChatMessage[], currentMessage: string): ChatM
  * @param userMessage  The newest customer utterance.
  * @param history      Prior turns of the conversation (oldest → newest).
  */
-export function groundParameters(userMessage: string, history: ChatMessage[]): GroundingResult {
-  const scope = buildScope(normaliseHistory(history, userMessage));
+export interface GroundingOptions {
+  /**
+   * Ignore previous clarification turns. Used when the customer restates a new
+   * refund request: values from an earlier exchange must not be resurrected.
+   */
+  ignoreClarificationContext?: boolean;
+}
+
+export function groundParameters(
+  userMessage: string,
+  history: ChatMessage[],
+  options: GroundingOptions = {},
+): GroundingResult {
+  const scopedHistory = options.ignoreClarificationContext
+    ? []
+    : normaliseHistory(history, userMessage);
+  const scope = buildScope(scopedHistory);
 
   /* --------------------------- ORDER ID --------------------------- */
   const orderId = resolveSlot('ORDER_ID', userMessage, scope, {
@@ -627,6 +682,7 @@ export function groundParameters(userMessage: string, history: ChatMessage[]): G
       value: orderId?.value,
       source: orderId?.source,
       confidence: orderId?.confidence ?? 0,
+      status: orderId ? 'candidate' : 'missing',
     },
     {
       param: 'ITEM_SKU',
@@ -635,6 +691,7 @@ export function groundParameters(userMessage: string, history: ChatMessage[]): G
       value: sku?.value,
       source: sku?.source,
       confidence: sku?.confidence ?? 0,
+      status: sku ? 'candidate' : 'missing',
     },
     {
       param: 'REASON',
@@ -643,6 +700,7 @@ export function groundParameters(userMessage: string, history: ChatMessage[]): G
       value: reason?.value,
       source: reason?.source,
       confidence: reason?.confidence ?? 0,
+      status: reason ? 'candidate' : 'missing',
     },
   ];
 

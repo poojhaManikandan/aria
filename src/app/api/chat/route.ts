@@ -23,6 +23,14 @@ const MAX_HISTORY_TURNS = 12;
 interface ChatRequestBody {
   message?: string;
   history?: ChatMessage[];
+  sessionId?: string;
+}
+
+/** Scope telemetry to the browser scenario that asked for this turn. */
+function sanitiseSessionId(input: unknown): string | undefined {
+  if (typeof input !== 'string') return undefined;
+  const value = input.trim().slice(0, 120);
+  return value.length > 0 ? value : undefined;
 }
 
 /** Accept only well-formed user/assistant turns, newest-last. */
@@ -100,6 +108,7 @@ export async function POST(request: Request) {
     result = await processTurn({
       message,
       history: sanitiseHistory(body?.history),
+      sessionId: sanitiseSessionId(body?.sessionId),
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : 'Unknown pipeline error';

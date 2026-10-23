@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "verify": "tsx scripts/verify-decider.ts && tsx scripts/verify-pipeline.ts"
+    "verify": "tsx scripts/verify-decider.ts && tsx scripts/verify-pipeline.ts && tsx scripts/verify-scenario-c.ts"
   },
   "dependencies": {
     "lucide-react": "^0.544.0",
