@@ -184,6 +184,21 @@ async function continuityChecks() {
     ['reason carried over', /damaged/.test(JSON.stringify(progressive?.args ?? {}))],
   ]);
 
+  // 5b) A numeric-only SKU reply must complete the refund without being
+  //     mistaken for a new order id.
+  const numericStep1 = await turn('refund for my damaged product', []);
+  const numericStep2 = await turn('46896', numericStep1.history);
+  const numericStep3 = await turn('9024', numericStep2.history);
+  const numericRefund = numericStep3.trace.tools.find((t) => t.name === 'execute_refund');
+  report('numeric-only SKU reply keeps the order id', [
+    ['order id captured', numericStep2.trace.grounding.checks.find((c) => c.param === 'ORDER_ID')?.value === '46896'],
+    ['sku still missing after order reply', numericStep2.trace.grounding.checks.find((c) => c.param === 'ITEM_SKU')?.present === false],
+    ['guardrail GREEN', numericStep3.trace.guardrail === 'GREEN'],
+    ['order id preserved', /46896/.test(JSON.stringify(numericRefund?.args ?? {}))],
+    ['numeric sku captured', /9024/.test(JSON.stringify(numericRefund?.args ?? {}))],
+    ['refund executed', numericRefund?.status === 'executed'],
+  ]);
+
   // 6) A bare order number must not be escalated to a human — it is the
   //    answer to the question the agent just asked.
   report('bare order-number reply continues the refund flow', [
@@ -208,6 +223,14 @@ async function continuityChecks() {
     ['arbitrary order accepted', /55555/.test(JSON.stringify(arbitraryRefund?.args ?? {}))],
     ['arbitrary SKU accepted', /XYZ-999/.test(JSON.stringify(arbitraryRefund?.args ?? {}))],
     ['refund executed', arbitraryRefund?.status === 'executed'],
+  ]);
+
+  const anyValues = await turn('refund order 123 sku abc because damaged', []);
+  const anyValuesRefund = anyValues.trace.tools.find((t) => t.name === 'execute_refund');
+  report('short numeric order id and letter-only SKU are accepted', [
+    ['short order accepted', /123/.test(JSON.stringify(anyValuesRefund?.args ?? {}))],
+    ['letter SKU accepted', /ABC/.test(JSON.stringify(anyValuesRefund?.args ?? {}))],
+    ['refund executed', anyValuesRefund?.status === 'executed'],
   ]);
 
   // 8) Unrecognised chat should get a helpful fallback, not a human ticket.

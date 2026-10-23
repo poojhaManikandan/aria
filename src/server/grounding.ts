@@ -82,6 +82,65 @@ const ID_STOPWORDS = new Set([
   'please',
 ]);
 
+/**
+ * Explicitly labelled values still need a small stopword guard: "order
+ * status" and "sku is damaged" are prose, not identifiers.
+ */
+const NON_IDENTIFIER_WORDS = new Set([
+  ...ID_STOPWORDS,
+  'sku',
+  'id',
+  'code',
+  'number',
+  'no',
+  'status',
+  'info',
+  'information',
+  'tracking',
+  'update',
+  'details',
+  'history',
+  'confirmation',
+  'email',
+  'refund',
+  'return',
+  'product',
+  'item',
+  'order',
+  'help',
+  'unknown',
+  'none',
+  'what',
+  'which',
+  'from',
+  'with',
+  'has',
+  'have',
+  'had',
+  'arrived',
+  'broken',
+  'damaged',
+  'defective',
+  'faulty',
+  'cracked',
+  'torn',
+  'scratched',
+  'ripped',
+  'malfunction',
+  'late',
+  'missing',
+  'lost',
+  'stopped',
+  'working',
+  'not',
+  'wrong',
+  'size',
+  'color',
+  'colour',
+  'quality',
+  'poor',
+]);
+
 /** Extract an order id from a chunk of text. Returns null when ambiguous. */
 export function extractOrderId(text: string): string | null {
   const candidates: string[] = [];
@@ -103,9 +162,14 @@ export function extractOrderId(text: string): string | null {
     const value = candidate.trim().replace(/[^\w-]/g, '');
     if (value.length < 3) continue;
     if (ID_STOPWORDS.has(value.toLowerCase())) continue;
-    // A valid reference contains at least one digit (order ids are numeric or
-    // alphanumeric-with-digits); pure words are rejected as hallucinated.
-    if (!/\d/.test(value)) continue;
+    if (NON_IDENTIFIER_WORDS.has(value.toLowerCase())) continue;
+
+    // Order ids are numeric, alphanumeric-with-digits, hyphenated, or an
+    // explicit uppercase reference. Plain lowercase prose is rejected.
+    const looksLikeId =
+      /\d/.test(value) || value.includes('-') || value === value.toUpperCase();
+    if (!looksLikeId) continue;
+
     return value;
   }
 
@@ -114,9 +178,14 @@ export function extractOrderId(text: string): string | null {
 
 /** Extract an explicitly stated SKU code, if any. */
 export function extractExplicitSku(text: string): string | null {
-  const match = /\bsku[-\s:#]*([a-z0-9][a-z0-9-]{2,})/i.exec(text);
+  const match =
+    /\bsku\b(?:[-\s:#]+(?:id|code|number|no\.?|is|of|the))?[-\s:#]*([a-z0-9][a-z0-9-]{2,})\b/i.exec(
+      text,
+    );
   if (!match) return null;
-  return match[1].trim().toUpperCase();
+  const value = match[1].trim().toUpperCase();
+  // Accept arbitrary demo codes, but never connector/prose words.
+  return NON_IDENTIFIER_WORDS.has(value.toLowerCase()) ? null : value;
 }
 
 /** Extract an explicit reason (keyword or free-text clause). */
@@ -183,7 +252,7 @@ export function extractReason(text: string): string | null {
  */
 export function extractBareOrderId(text: string): string | null {
   const withoutMoney = text.replace(/\$\s*[\d.,]+/g, ' ');
-  const match = /\b(\d{4,})\b/.exec(withoutMoney);
+  const match = /\b(\d{3,})\b/.exec(withoutMoney);
   return match ? match[1] : null;
 }
 
@@ -193,6 +262,32 @@ export function extractSkuShapedToken(text: string): string | null {
   if (!match) return null;
   // Require at least one digit so hyphenated words can't masquerade as SKUs.
   return /\d/.test(match[1]) ? match[1].toUpperCase() : null;
+}
+
+/**
+ * Extract a bare SKU answer, e.g. "9024", "TEST" or "SKU 9024", when the agent
+ * asked for a SKU. Arbitrary demo data is allowed, including letter-only codes.
+ */
+export function extractBareSku(text: string): string | null {
+  const firstToken = text
+    .trim()
+    .replace(/^sku[-\s:#]*/i, '')
+    .split(/\s+/)[0]
+    ?.replace(/[^\w-]/g, '');
+
+  if (!firstToken) return null;
+  const value = firstToken.toUpperCase();
+  if (!/^[A-Z0-9][A-Z0-9-]{2,}$/.test(value)) return null;
+  if (NON_IDENTIFIER_WORDS.has(value.toLowerCase())) return null;
+  return value;
+}
+
+/** Remove SKU references before looking for a bare order number. */
+function stripSkuReferences(text: string): string {
+  return text.replace(
+    /\bsku\b(?:[-\s:#]+(?:id|code|number|no\.?|is|of|the))?[-\s:#]*[a-z0-9][a-z0-9-]*/gi,
+    ' ',
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -392,19 +487,22 @@ function resolveSlot(
   }
 
   const asked = scope.askedAt(param);
+  const currentlyAsked = Boolean(scope.clarification?.requests?.includes(param));
 
-  /* 2 — shorthand answer to our own question */
-  if (asked >= 0 && extractors.shorthand) {
+  /* 2 — shorthand answer to the question we are asking right now */
+  if (currentlyAsked && extractors.shorthand) {
     const shorthand = extractors.shorthand(currentMessage);
     if (shorthand) {
       return { value: shorthand.value, source: 'current_message', confidence: 0.9 };
     }
   }
 
-  /* 3 — answered after we asked, never before */
+  /* 3 — answered after we asked, never before. Only explicit values are
+     accepted from context: a bare number could be either an order id or a
+     SKU, so context shorthand can silently overwrite the other slot. */
   if (asked >= 0) {
     for (const text of scope.turnsAfter(asked)) {
-      const found = extractors.strict(text) ?? extractors.shorthand?.(text) ?? null;
+      const found = extractors.strict(text);
       if (found) return { value: found.value, source: 'chat_context', confidence: 0.86 };
     }
   }
@@ -475,7 +573,7 @@ export function groundParameters(userMessage: string, history: ChatMessage[]): G
         text,
       );
       if (refundContext) {
-        const bare = extractBareOrderId(text);
+        const bare = extractBareOrderId(stripSkuReferences(text));
         if (bare) return { value: bare, source: 'current_message' };
       }
 
@@ -483,7 +581,7 @@ export function groundParameters(userMessage: string, history: ChatMessage[]): G
     },
     // A bare "10231" is only read as an order id when we asked for one.
     shorthand: (text) => {
-      const value = extractBareOrderId(text);
+      const value = extractBareOrderId(stripSkuReferences(text));
       return value ? { value, source: 'current_message' } : null;
     },
   });
@@ -496,10 +594,18 @@ export function groundParameters(userMessage: string, history: ChatMessage[]): G
       const catalog = resolveProductToSku(text);
       return catalog ? { value: catalog.sku, source: 'catalog' } : null;
     },
-    // "SHOE-WHT-02" style tokens only count when we asked for the SKU.
+    // "SHOE-WHT-02" style tokens, or a plain demo code such as "9024", only
+    // count when we asked for the SKU. When Order ID and SKU are both still
+    // open, a bare number is treated as the order id the agent asked for first.
     shorthand: (text) => {
-      const value = extractSkuShapedToken(text);
-      return value ? { value, source: 'current_message' } : null;
+      const shaped = extractSkuShapedToken(text);
+      if (shaped) return { value: shaped, source: 'current_message' };
+
+      const orderAlsoAsked = Boolean(scope.clarification?.requests?.includes('ORDER_ID'));
+      if (orderAlsoAsked) return null;
+
+      const bare = extractBareSku(text);
+      return bare ? { value: bare, source: 'current_message' } : null;
     },
   });
 
