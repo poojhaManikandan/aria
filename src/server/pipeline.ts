@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   ChatMessage,
   DecisionLabel,
+  GroundingParam,
   GroundingResult,
   GuardrailState,
   PipelineAction,
@@ -91,30 +92,123 @@ function composeBlockMessage(orderId: string | null, exposure: number): string {
   );
 }
 
+/** The most recent assistant turn only counts if it asked a clarification. */
+function lastClarificationTurn(history: ChatMessage[]): ChatMessage | null {
+  const lastAssistant = [...history].reverse().find((m) => m.role === 'assistant');
+  return lastAssistant?.requests?.length ? lastAssistant : null;
+}
+
+/** Natural-language phrase for a required parameter. */
+function phraseForParam(name: string): string {
+  if (name === 'Order ID') return 'your Order ID';
+  if (name === 'Item SKU') return 'the Item SKU';
+  return 'the reason for the return';
+}
+
+/** A dynamic follow-up question for the first still-missing parameter. */
+function askForParam(name: string): string {
+  if (name === 'Order ID') {
+    return 'I still need your Order ID to locate the purchase. Could you please provide the order number?';
+  }
+  if (name === 'Item SKU') {
+    return 'I still need the Item SKU to locate your item in our catalog. Could you please provide the SKU?';
+  }
+  return 'I still need the reason for the return. Could you tell me what went wrong with the item?';
+}
+
+/** Acknowledge a value the customer has just supplied, without re-asking. */
+function acknowledgeSlot(param: GroundingParam, value: string): string {
+  if (param === 'REASON') {
+    const lower = value.toLowerCase();
+    const defect = [
+      'broken',
+      'damaged',
+      'defective',
+      'faulty',
+      'cracked',
+      'torn',
+      'scratched',
+      'ripped',
+      'malfunction',
+      'not working',
+      'stopped working',
+    ].find((keyword) => lower.includes(keyword));
+
+    if (defect) {
+      const description =
+        defect === 'not working' || defect === 'stopped working'
+          ? `${defect} when it arrived`
+          : `${defect} upon receipt`;
+      return `Thank you for confirming the item was ${description}.`;
+    }
+    if (/wrong (size|colour|color|item)/.test(lower)) {
+      return `Thank you for confirming the item was ${lower}.`;
+    }
+    return `Thank you for confirming the reason for your return: ${value}.`;
+  }
+
+  if (param === 'ORDER_ID') return `Thanks — I've noted order #${value}.`;
+  return `Thanks — I've noted SKU ${value}.`;
+}
+
+interface ClarificationOptions {
+  reason?: string;
+  /** True when this turn continues an already-open clarification exchange. */
+  followUp?: boolean;
+  /** Slots the customer supplied for the first time in this turn. */
+  newlyGrounded?: Array<{ param: GroundingParam; value: string }>;
+}
+
 /** Clarification copy used when grounding is incomplete. */
-function composeClarificationMessage(missing: string[], reason?: string): string {
-  const subject = reason ? `a refund for your ${reason}` : 'that refund';
-
-  const phrase = (name: string) => {
-    if (name === 'Order ID') return 'your Order ID';
-    if (name === 'Item SKU') return 'the Item SKU';
-    return 'the reason for the return';
-  };
-
-  // One question at a time, in the canonical Order ID → Item SKU → Reason
-  // order. Everything still outstanding is named in the follow-up so the
-  // customer always knows the full picture.
+function composeClarificationMessage(
+  missing: string[],
+  options: ClarificationOptions = {},
+): string {
+  const { reason, followUp = false, newlyGrounded = [] } = options;
   const [first, ...rest] = missing;
-  const ask = phrase(first);
-  const outstanding = rest.map(phrase);
+  const outstanding = rest.map(phraseForParam);
 
-  return (
-    `I can certainly help you with ${subject}. However, I need a bit more information first. ` +
-    `Could you please provide ${ask}?\n\n` +
-    `As soon as I have it${outstanding.length ? ` and ${outstanding.join(' and ')}` : ''}, ` +
-    `I'll process the refund and the credit will land back on your original payment method ` +
-    `in 3–5 business days. No refund has been issued yet.`
+  // First ask — keep the original deterministic copy so the opening question
+  // is stable and testable.
+  if (!followUp) {
+    const subject = reason ? `a refund for your ${reason}` : 'that refund';
+
+    return (
+      `I can certainly help you with ${subject}. However, I need a bit more information first. ` +
+      `Could you please provide ${phraseForParam(first)}?\n\n` +
+      `As soon as I have it${outstanding.length ? ` and ${outstanding.join(' and ')}` : ''}, ` +
+      `I'll process the refund and the credit will land back on your original payment method ` +
+      `in 3–5 business days. No refund has been issued yet.`
+    );
+  }
+
+  const parts: string[] = [];
+  const acknowledgements = newlyGrounded.map((slot) => acknowledgeSlot(slot.param, slot.value));
+
+  if (acknowledgements.length > 0) {
+    parts.push(...acknowledgements);
+    parts.push(askForParam(first));
+    if (outstanding.length) {
+      parts.push(`I'll also need ${outstanding.join(' and ')}.`);
+    }
+  } else {
+    // The customer did not add a new slot this turn. Ask for everything that
+    // is still outstanding in one consolidated request rather than repeating
+    // the previous question word-for-word.
+    const all = missing.map(phraseForParam);
+    parts.push(
+      `I still need ${all.join(' and ')} to continue. Could you please send ${
+        all.length > 1 ? 'both' : 'it'
+      } when you can?`,
+    );
+  }
+
+  parts.push(
+    `No refund has been issued yet — once I have these details I'll process it and the credit ` +
+      `will land back on your original payment method in 3–5 business days.`,
   );
+
+  return parts.join(' ');
 }
 
 /**
@@ -245,10 +339,23 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
           `Grounding incomplete — missing ${grounding.missing.join(', ')}`,
         ),
       );
-      assistantMessage = composeClarificationMessage(
-        grounding.missing,
-        grounding.checks.find((c) => c.param === 'REASON')?.value,
-      );
+      const previousClarification = lastClarificationTurn(input.history);
+      const newlyGrounded = grounding.checks
+        .filter((check) => {
+          if (!check.present || !check.value) return false;
+          if (check.source !== 'current_message' && check.source !== 'catalog') return false;
+          const previous = previousClarification?.resolved?.[check.param];
+          return (
+            !previous || previous.trim().toLowerCase() !== check.value.trim().toLowerCase()
+          );
+        })
+        .map((check) => ({ param: check.param, value: check.value as string }));
+
+      assistantMessage = composeClarificationMessage(grounding.missing, {
+        reason: grounding.checks.find((c) => c.param === 'REASON')?.value,
+        followUp: Boolean(previousClarification),
+        newlyGrounded,
+      });
       return;
     }
 

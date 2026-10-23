@@ -239,6 +239,12 @@ export function isClarificationReply(
   // The customer is clearly doing something else.
   if (attributions.some((a) => NON_ANSWER_FEATURES.has(a.feature))) return false;
 
+  // A descriptive answer ("it was broken when it arrived") is just as valid
+  // a clarification reply as a bare SKU. The customer may volunteer the reason
+  // while we were waiting for another slot — that must continue the refund
+  // workflow instead of falling through to a fresh (and context-less) request.
+  if (extractReason(message)) return true;
+
   return requested.some((param) => {
     switch (param) {
       case 'ORDER_ID':
@@ -288,6 +294,8 @@ interface ExchangeScope {
   askedAt(param: GroundingParam): number;
   /** User turns that came after a given history index (newest first). */
   turnsAfter(index: number): string[];
+  /** Every user turn in the open clarification exchange (newest first). */
+  exchangeTurns(): string[];
   /** A slot that was already resolved earlier in this exchange. */
   carried(param: GroundingParam): string | null;
 }
@@ -328,6 +336,19 @@ function buildScope(turns: ChatMessage[]): ExchangeScope {
     return out;
   };
 
+  const exchangeTurns = (): string[] => {
+    if (chain.length === 0) return [];
+    // Include the request that opened the exchange as well as every following
+    // customer turn. This is how a reason volunteered while the agent was
+    // asking for the SKU is recovered from the chat history.
+    const start = Math.max(0, chain[0].index - 1);
+    const out: string[] = [];
+    for (let i = turns.length - 1; i >= start; i -= 1) {
+      if (turns[i].role === 'user') out.push(turns[i].content);
+    }
+    return out;
+  };
+
   const newest = chain.length ? chain[chain.length - 1] : null;
 
   const carried = (param: GroundingParam): string | null => {
@@ -341,6 +362,7 @@ function buildScope(turns: ChatMessage[]): ExchangeScope {
     clarification: newest?.message ?? null,
     askedAt,
     turnsAfter,
+    exchangeTurns,
     carried,
   };
 }
@@ -363,7 +385,12 @@ function resolveSlot(
   param: GroundingParam,
   currentMessage: string,
   scope: ExchangeScope,
-  extractors: { strict: Extractor; shorthand?: Extractor },
+  extractors: {
+    strict: Extractor;
+    shorthand?: Extractor;
+    /** Extra user turns to scan for an explicitly stated value. */
+    contextTurns?: () => string[];
+  },
 ): { value: string; source: GroundingCheck['source']; confidence: number } | null {
   /* 1 — stated right now */
   const direct = extractors.strict(currentMessage);
@@ -390,6 +417,17 @@ function resolveSlot(
     for (const text of scope.turnsAfter(asked)) {
       const found = extractors.strict(text) ?? extractors.shorthand?.(text) ?? null;
       if (found) return { value: found.value, source: 'chat_context', confidence: 0.86 };
+    }
+  }
+
+  /* 3b — stated earlier in the open clarification exchange, even when this
+     slot was not the one we asked for. Reason is the important case: the
+     customer can explain what broke while we are waiting for the SKU, and
+     that explanation still belongs in the refund tool payload. */
+  if (extractors.contextTurns) {
+    for (const text of extractors.contextTurns()) {
+      const found = extractors.strict(text) ?? extractors.shorthand?.(text) ?? null;
+      if (found) return { value: found.value, source: 'chat_context', confidence: 0.84 };
     }
   }
 
@@ -469,6 +507,8 @@ export function groundParameters(userMessage: string, history: ChatMessage[]): G
       const value = extractReason(text);
       return value ? { value, source: 'current_message' } : null;
     },
+    // The reason is often volunteered before/while we ask for another slot.
+    contextTurns: () => scope.exchangeTurns(),
   });
 
   const checks: GroundingCheck[] = [
