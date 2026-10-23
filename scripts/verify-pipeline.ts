@@ -3,8 +3,9 @@
  * Run with:  npx tsx scripts/verify-pipeline.ts
  */
 import { processTurn } from '../src/server/pipeline';
+import { MAIN_AGENT_FALLBACK_MESSAGE, runMainAgent } from '../src/server/main-agent';
 import { SCENARIOS } from '../src/lib/constants';
-import type { ChatMessage, GroundingParam } from '../src/lib/types';
+import type { ChatMessage, GroundingParam, GroundingResult } from '../src/lib/types';
 
 const EXPECTED: Record<string, { label: string; guardrail: string; mainAgent: boolean; toolStatus: string }> = {
   A: { label: 'SAFE_INFO_REQUEST', guardrail: 'GREEN', mainAgent: true, toolStatus: 'executed' },
@@ -56,6 +57,10 @@ async function main() {
   console.log('');
   console.log('── Conversation continuity (regression) ──────────────────────');
   await continuityChecks();
+
+  console.log('');
+  console.log('── Layer 3 resilience (regression) ───────────────────────────');
+  await layer3ResilienceChecks();
 
   console.log(failures === 0 ? '✅ Pipeline verified.' : `❌ ${failures} scenario(s) failed.`);
   process.exit(failures === 0 ? 0 : 1);
@@ -210,6 +215,75 @@ async function continuityChecks() {
   report('general chat gets a helpful fallback', [
     ['not escalated', smallTalk.trace.action !== 'ESCALATED_TO_HUMAN'],
     ['explains capabilities', /order tracking/i.test(smallTalk.trace.assistantMessage)],
+  ]);
+}
+
+async function layer3ResilienceChecks() {
+  const grounding: GroundingResult = {
+    approved: true,
+    checks: [
+      {
+        param: 'ORDER_ID',
+        label: 'Order ID',
+        present: true,
+        value: '99482',
+        source: 'current_message',
+        confidence: 1,
+      },
+      {
+        param: 'ITEM_SKU',
+        label: 'Item SKU',
+        present: true,
+        value: 'SHOE-BLU-01',
+        source: 'current_message',
+        confidence: 1,
+      },
+      {
+        param: 'REASON',
+        label: 'Reason',
+        present: true,
+        value: 'damaged',
+        source: 'current_message',
+        confidence: 1,
+      },
+    ],
+    missing: [],
+    missingParams: [],
+  };
+
+  const failedEvents: Array<{ stage: string }> = [];
+  const failedRefund = await runMainAgent({
+    label: 'VALID_RETURN_REQUEST',
+    userMessage: 'refund order 99482 sku SHOE-BLU-01 because damaged',
+    grounding,
+    authorisation: null,
+    emit: (event) => {
+      failedEvents.push(event);
+    },
+  });
+  const failedTool = failedRefund.tools.find((tool) => tool.name === 'execute_refund');
+  report('execute_refund failure returns a graceful reply', [
+    ['tool marked failed', failedTool?.status === 'failed'],
+    ['no refund executed', !failedRefund.tools.some((tool) => tool.status === 'executed')],
+    ['reply says no money moved', /no money has moved/i.test(failedRefund.message)],
+    ['tool-error telemetry emitted', failedEvents.some((event) => event.stage === 'TOOL_ERROR')],
+  ]);
+
+  const fallbackEvents: Array<{ stage: string }> = [];
+  const broken = await runMainAgent({
+    label: 'VALID_RETURN_REQUEST',
+    userMessage: 'refund order 99482 sku SHOE-BLU-01 because damaged',
+    grounding: null as unknown as GroundingResult,
+    authorisation: 'GROUNDING_APPROVED::v1',
+    emit: (event) => {
+      fallbackEvents.push(event);
+    },
+  });
+  report('unexpected Layer 3 failure is caught', [
+    ['fallback message returned', broken.message === MAIN_AGENT_FALLBACK_MESSAGE],
+    ['no tools returned', broken.tools.length === 0],
+    ['zero model cost', broken.costUsd === 0],
+    ['fallback telemetry emitted', fallbackEvents.some((event) => event.stage === 'AGENT_FALLBACK')],
   ]);
 }
 
