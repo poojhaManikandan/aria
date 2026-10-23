@@ -147,7 +147,8 @@ export function useAgentConsole(): AgentConsoleApi {
         });
 
         if (!response.ok) {
-          throw new Error(`Pipeline returned ${response.status}`);
+          const failure = (await response.json().catch(() => null)) as { error?: string } | null;
+          throw new Error(failure?.error ?? `Pipeline returned ${response.status}`);
         }
 
         const payload = (await response.json()) as {

@@ -90,10 +90,18 @@ export async function POST(request: Request) {
     );
   }
 
-  const { trace, events } = await processTurn({
-    message,
-    history: sanitiseHistory(body?.history),
-  });
+  let result: Awaited<ReturnType<typeof processTurn>>;
 
-  return NextResponse.json({ trace, events });
+  try {
+    result = await processTurn({
+      message,
+      history: sanitiseHistory(body?.history),
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'Unknown pipeline error';
+    console.error('[api/chat] pipeline failure', error);
+    return NextResponse.json({ error: `Pipeline error: ${detail}` }, { status: 500 });
+  }
+
+  return NextResponse.json(result);
 }
