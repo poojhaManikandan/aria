@@ -201,6 +201,8 @@ export interface PipelineTrace {
 }
 
 export interface ChatResponse {
+  success: true;
+  message: string;
   trace: PipelineTrace;
   events: TelemetryEvent[];
 }

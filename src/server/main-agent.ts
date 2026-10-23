@@ -58,6 +58,14 @@ export interface MainAgentOutcome {
   costUsd: number;
 }
 
+/**
+ * Customer-facing copy used whenever Layer 3 cannot finish a turn. Keeping the
+ * wording here means the pipeline wrapper and the agent-level wrapper agree.
+ */
+export const MAIN_AGENT_FALLBACK_MESSAGE =
+  'I hit a temporary issue while completing that request, so no action was taken. ' +
+  'Please try again in a moment — or ask me to pass this to a human agent and I will open a ticket.';
+
 /* ------------------------------------------------------------------ */
 /* Answer composition                                                   */
 /* ------------------------------------------------------------------ */
@@ -155,7 +163,7 @@ function composeEscalationAnswer(ticket: { ticketId: string; queue: string; eta:
 /**
  * Execute one main-agent turn for the given route.
  */
-export async function runMainAgent(ctx: MainAgentContext): Promise<MainAgentOutcome> {
+async function runMainAgentImpl(ctx: MainAgentContext): Promise<MainAgentOutcome> {
   const started = Date.now();
   const tools: ToolInvocation[] = [];
   const seed = `main:${ctx.userMessage}`;
@@ -313,36 +321,77 @@ export async function runMainAgent(ctx: MainAgentContext): Promise<MainAgentOutc
             `(for example SHOE-BLU-01)? No refund has been issued yet.`;
         } else {
           const toolStart = Date.now();
-          const refund = await executeRefund({ order_id: orderId, sku, reason }, ctx.authorisation);
-          const toolLatency = Date.now() - toolStart;
 
-          tools.push(
-            toolInvocation(
-              'execute_refund',
+          try {
+            const refund = await executeRefund(
               { order_id: orderId, sku, reason },
-              'executed',
-              toolLatency,
-              refund,
-            ),
-          );
+              ctx.authorisation,
+            );
+            const toolLatency = Date.now() - toolStart;
 
-          ctx.emit({
-            layer: 3,
-            stage: 'TOOL_CALL',
-            kind: 'tool',
-            level: 'success',
-            title: 'Tool · execute_refund',
-            message: `${refund.transactionId} · ${money(refund.amount)} → ${refund.sku}`,
-            durationMs: toolLatency,
-            data: {
-              tool: 'execute_refund',
-              args: { order_id: orderId, sku },
-              transactionId: refund.transactionId,
-              amount: refund.amount,
-            },
-          });
+            tools.push(
+              toolInvocation(
+                'execute_refund',
+                { order_id: orderId, sku, reason },
+                'executed',
+                toolLatency,
+                refund,
+              ),
+            );
 
-          message = composeRefundAnswer(refund, reason);
+            ctx.emit({
+              layer: 3,
+              stage: 'TOOL_CALL',
+              kind: 'tool',
+              level: 'success',
+              title: 'Tool · execute_refund',
+              message: `${refund.transactionId} · ${money(refund.amount)} → ${refund.sku}`,
+              durationMs: toolLatency,
+              data: {
+                tool: 'execute_refund',
+                args: { order_id: orderId, sku },
+                transactionId: refund.transactionId,
+                amount: refund.amount,
+              },
+            });
+
+            message = composeRefundAnswer(refund, reason);
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : 'Unknown refund tool failure';
+            const toolLatency = Date.now() - toolStart;
+
+            tools.push(
+              toolInvocation(
+                'execute_refund',
+                { order_id: orderId, sku, reason },
+                'failed',
+                toolLatency,
+                undefined,
+                detail,
+              ),
+            );
+
+            ctx.emit({
+              layer: 3,
+              stage: 'TOOL_ERROR',
+              kind: 'tool',
+              level: 'error',
+              title: 'Tool · execute_refund failed',
+              message: `No refund was issued for #${orderId} / ${sku}: ${detail}`,
+              durationMs: toolLatency,
+              data: {
+                tool: 'execute_refund',
+                args: { order_id: orderId, sku, reason },
+                error: detail,
+                refunded: false,
+              },
+            });
+
+            message =
+              `I wasn't able to complete the refund for **${sku}** on order **#${orderId}** just now, ` +
+              `so no money has moved. The failure is logged and a human agent can pick it up. ` +
+              `You can also try again in a moment — the item and reason are still on file.`;
+          }
         }
       }
     }
@@ -385,4 +434,41 @@ export async function runMainAgent(ctx: MainAgentContext): Promise<MainAgentOutc
     latencyMs,
     costUsd: MODEL_COST.MAIN_AGENT_USD,
   };
+}
+
+/**
+ * Public Layer-3 entry point. Any unexpected failure in planning, lookups or
+ * answer composition is converted into a graceful reply so the HTTP layer does
+ * not surface a 500 for an otherwise recoverable turn.
+ */
+export async function runMainAgent(ctx: MainAgentContext): Promise<MainAgentOutcome> {
+  const started = Date.now();
+
+  try {
+    return await runMainAgentImpl(ctx);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'Unknown main-agent failure';
+
+    try {
+      ctx.emit({
+        layer: 3,
+        stage: 'AGENT_FALLBACK',
+        kind: 'log',
+        level: 'error',
+        title: 'Layer 3 recovered',
+        message: `Main agent failed (${detail}) — returned a safe simulated response.`,
+        durationMs: Date.now() - started,
+        data: { error: detail, fallback: true },
+      });
+    } catch {
+      // Telemetry must never be allowed to take down the turn.
+    }
+
+    return {
+      message: MAIN_AGENT_FALLBACK_MESSAGE,
+      tools: [],
+      latencyMs: Date.now() - started,
+      costUsd: 0,
+    };
+  }
 }

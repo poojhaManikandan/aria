@@ -17,7 +17,7 @@ import { bus } from './bus';
 import { isLowConfidence, runDecider } from './decider';
 import { groundParameters, isClarificationReply } from './grounding';
 import { resolveOrder } from './knowledge';
-import { runMainAgent } from './main-agent';
+import { MAIN_AGENT_FALLBACK_MESSAGE, runMainAgent } from './main-agent';
 import { GROUNDING_TOKEN, estimateExposure, seededJitter, sleep, toolInvocation } from './tools';
 
 /**
@@ -70,6 +70,41 @@ function createEmitter(traceId: string) {
       return event;
     },
   };
+}
+
+/**
+ * Invoke Layer 3 through a guard so a main-agent / tool failure degrades to a
+ * safe simulated answer instead of crashing the API request with a 500.
+ */
+async function runMainAgentSafely(
+  context: Parameters<typeof runMainAgent>[0],
+): Promise<Awaited<ReturnType<typeof runMainAgent>>> {
+  try {
+    return await runMainAgent(context);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'Unknown main-agent failure';
+
+    try {
+      context.emit({
+        layer: 3,
+        stage: 'AGENT_FALLBACK',
+        kind: 'log',
+        level: 'warn',
+        title: 'Layer 3 fallback',
+        message: `Main agent failed (${detail}) — returned a safe simulated response.`,
+        data: { error: detail, fallback: true },
+      });
+    } catch {
+      // Telemetry must never be allowed to take down the turn.
+    }
+
+    return {
+      message: MAIN_AGENT_FALLBACK_MESSAGE,
+      tools: [],
+      latencyMs: 0,
+      costUsd: 0,
+    };
+  }
 }
 
 /** Short human label for a decision label. */
@@ -403,7 +438,7 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
 
     guardrail = 'GREEN';
     action = 'PROCEED_TO_MAIN_AGENT';
-    const outcome = await runMainAgent({
+    const outcome = await runMainAgentSafely({
       label: 'VALID_RETURN_REQUEST',
       userMessage: input.message,
       grounding,
@@ -499,7 +534,7 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
     }
     guardrail = 'AMBER';
     action = 'ESCALATED_TO_HUMAN';
-    const outcome = await runMainAgent({
+    const outcome = await runMainAgentSafely({
       label: 'HUMAN_ESCALATION',
       userMessage: input.message,
       grounding,
@@ -529,7 +564,7 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
         { data: { confidence: decision.confidence, threshold: 0.5, fallback: 'SAFE_INFO_REQUEST' } },
       );
     }
-    const outcome = await runMainAgent({
+    const outcome = await runMainAgentSafely({
       label: 'SAFE_INFO_REQUEST',
       userMessage: input.message,
       grounding,

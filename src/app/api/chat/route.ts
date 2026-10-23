@@ -74,20 +74,24 @@ export async function POST(request: Request) {
   try {
     body = (await request.json()) as ChatRequestBody;
   } catch {
-    return NextResponse.json({ error: 'Request body must be valid JSON.' }, { status: 400 });
+    return NextResponse.json(
+      { success: false, error: 'Request body must be valid JSON.', message: 'Request body must be valid JSON.' },
+      { status: 400 },
+    );
   }
 
   const message = String(body?.message ?? '').trim();
 
   if (!message) {
-    return NextResponse.json({ error: 'Message must not be empty.' }, { status: 400 });
+    return NextResponse.json(
+      { success: false, error: 'Message must not be empty.', message: 'Message must not be empty.' },
+      { status: 400 },
+    );
   }
 
   if (message.length > MAX_MESSAGE_CHARS) {
-    return NextResponse.json(
-      { error: `Message exceeds the ${MAX_MESSAGE_CHARS} character limit.` },
-      { status: 413 },
-    );
+    const error = `Message exceeds the ${MAX_MESSAGE_CHARS} character limit.`;
+    return NextResponse.json({ success: false, error, message: error }, { status: 413 });
   }
 
   let result: Awaited<ReturnType<typeof processTurn>>;
@@ -100,8 +104,16 @@ export async function POST(request: Request) {
   } catch (error) {
     const detail = error instanceof Error ? error.message : 'Unknown pipeline error';
     console.error('[api/chat] pipeline failure', error);
-    return NextResponse.json({ error: `Pipeline error: ${detail}` }, { status: 500 });
+    return NextResponse.json(
+      { success: false, error: `Pipeline error: ${detail}`, message: `Pipeline error: ${detail}` },
+      { status: 500 },
+    );
   }
 
-  return NextResponse.json(result);
+  return NextResponse.json({
+    success: true,
+    message: result.trace.assistantMessage,
+    trace: result.trace,
+    events: result.events,
+  });
 }
