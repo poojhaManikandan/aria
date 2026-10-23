@@ -36,6 +36,8 @@ export const CATALOG: CatalogItem[] = [
       ['blue', 'sneaker'],
       ['blue', 'running'],
       ['aero'],
+      ['shoe'],
+      ['sneaker'],
     ],
   },
   {
@@ -46,6 +48,8 @@ export const CATALOG: CatalogItem[] = [
       ['white', 'shoe'],
       ['white', 'sneaker'],
       ['cloudstep'],
+      ['shoe'],
+      ['sneaker'],
     ],
   },
   {
@@ -185,6 +189,44 @@ export function findOrder(orderId: string): MockOrder | undefined {
   return ORDERS.find((o) => o.orderId.toLowerCase() === needle);
 }
 
+function stableHash(input: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * Resolve an order for the demo. Known orders come from the mock ledger; any
+ * other customer-supplied value is accepted as deterministic demo data so the
+ * agent can be exercised with arbitrary IDs instead of only the seeded ones.
+ */
+export function resolveOrder(orderId: string, sku?: string): MockOrder {
+  const existing = findOrder(orderId);
+  if (existing) return existing;
+
+  const normalizedId = orderId.trim().replace(/^#/, '') || '00000';
+  const requestedSku = sku?.trim().toUpperCase() || 'DEMO-ITEM-01';
+  const item = findCatalogItem(requestedSku);
+  const price = item?.price ?? 99;
+  const tracking = `DHL${String(stableHash(normalizedId)).padStart(9, '0').slice(0, 9)}`;
+
+  return {
+    orderId: normalizedId,
+    customer: 'Demo Customer',
+    email: 'demo@example.com',
+    placedAt: '2026-10-20',
+    status: 'Delivered',
+    carrier: 'DHL Express',
+    tracking,
+    eta: 'Delivered (demo data)',
+    items: [{ sku: requestedSku, qty: 1, price }],
+    total: price,
+  };
+}
+
 export function findCatalogItem(sku: string): CatalogItem | undefined {
   const needle = sku.trim().toLowerCase();
   return CATALOG.find((c) => c.sku.toLowerCase() === needle);
@@ -192,16 +234,38 @@ export function findCatalogItem(sku: string): CatalogItem | undefined {
 
 /**
  * Resolve a product mention in free-form text to a catalog SKU.
- * Every alias keyword must be present for a match, which keeps the
- * grounding check deliberately conservative.
+ * Matches are scored by alias specificity (number of keywords), so
+ * "white sneakers" beats the generic "sneaker" alias even when the generic
+ * alias is declared first. Plural forms are normalised.
  */
 export function resolveProductToSku(text: string): CatalogItem | undefined {
-  const haystack = ` ${text.toLowerCase()} `;
+  const plurals: Record<string, string> = {
+    shoes: 'shoe',
+    sneakers: 'sneaker',
+    headphones: 'headphone',
+    earphones: 'earphone',
+    backpacks: 'backpack',
+    monitors: 'monitor',
+    keyboards: 'keyboard',
+    screens: 'screen',
+    displays: 'display',
+    mats: 'mat',
+  };
+  const normalized = text.toLowerCase().replace(
+    /\b(shoes|sneakers|headphones|earphones|backpacks|monitors|keyboards|screens|displays|mats)\b/g,
+    (word) => plurals[word] ?? word,
+  );
+  const haystack = ` ${normalized} `;
+
+  let best: { item: CatalogItem; score: number } | undefined;
   for (const item of CATALOG) {
     for (const alias of item.aliases) {
       const hit = alias.every((kw) => haystack.includes(` ${kw}`) || haystack.includes(`${kw} `));
-      if (hit) return item;
+      if (hit && (!best || alias.length > best.score)) {
+        best = { item, score: alias.length };
+      }
     }
   }
-  return undefined;
+
+  return best?.item;
 }

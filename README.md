@@ -201,7 +201,8 @@ src/
 
 ## Production notes
 
-- **Fail-safe default** — low confidence escalates to a human rather than guessing.
+- **Fail-safe default** — low-confidence money-moving routes escalate to a human rather than guessing.
+  Low-confidence read-only turns fall back to a helpful support reply with no tools attached.
 - **Defence in depth** — the refund tool rejects calls without a Layer-2 token, regardless of caller.
 - **Typed contract** — one `types.ts` shared by server and client keeps the wire format honest.
 - **Bounded inputs** — 2,000-character messages, 12-turn history, capped telemetry buffer.
@@ -219,3 +220,6 @@ src/
 `runMainAgent` simulates a Bedrock Claude 3.5 Sonnet turn. Latencies and prices are simulated but
 measured as wall-clock in the pipeline. Swapping in real models means replacing those two modules —
 the pipeline, tools, guardrails, telemetry and UI are already production-shaped.
+
+The seeded order ledger is only sample data: any other order id or SKU the tester supplies is resolved
+deterministically as a demo record, so the agent can be exercised with arbitrary values.

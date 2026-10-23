@@ -1,6 +1,6 @@
 import type { ToolInvocation } from '@/lib/types';
 import { MODEL_COST } from '@/lib/constants';
-import { CATALOG, POLICY, findCatalogItem, findOrder, type MockOrder } from './knowledge';
+import { CATALOG, POLICY, findCatalogItem, resolveOrder, type MockOrder } from './knowledge';
 import { fnv1a } from './decider';
 
 /**
@@ -57,9 +57,9 @@ export function sleep(ms: number): Promise<void> {
 /**
  * Read-only order lookup. Safe to call from the main agent.
  */
-export async function lookupOrder(orderId: string): Promise<MockOrder | null> {
+export async function lookupOrder(orderId: string, sku?: string): Promise<MockOrder | null> {
   await sleep(seededJitter(`lookup:${orderId}`, 70, 210));
-  return findOrder(orderId) ?? null;
+  return orderId.trim() ? resolveOrder(orderId, sku) : null;
 }
 
 /**
@@ -81,11 +81,7 @@ export async function executeRefund(
 
   await sleep(seededJitter(`refund:${args.order_id}:${args.sku}`, 90, 240));
 
-  const order = findOrder(args.order_id);
-  if (!order) {
-    throw new Error(`Order ${args.order_id} was not found in the order ledger.`);
-  }
-
+  const order = resolveOrder(args.order_id, args.sku);
   const line = order.items.find((item) => item.sku.toUpperCase() === args.sku.toUpperCase());
   if (!line) {
     throw new Error(`SKU ${args.sku} is not present on order ${args.order_id}.`);
@@ -131,8 +127,7 @@ export async function createSupportTicket(
 export function estimateExposure(text: string): number {
   const idMatch = /\b(?:order|#)\s*#?(\d{3,})\b/i.exec(text);
   if (!idMatch) return 0;
-  const order = findOrder(idMatch[1]);
-  return order ? order.total : 0;
+  return resolveOrder(idMatch[1]).total;
 }
 
 /** Catalog lookup used by the main agent when explaining a product. */

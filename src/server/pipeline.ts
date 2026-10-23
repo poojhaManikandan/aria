@@ -16,7 +16,7 @@ import { MODEL_COST, MODEL_NAMES } from '@/lib/constants';
 import { bus } from './bus';
 import { isLowConfidence, runDecider } from './decider';
 import { groundParameters, isClarificationReply } from './grounding';
-import { findOrder } from './knowledge';
+import { resolveOrder } from './knowledge';
 import { runMainAgent } from './main-agent';
 import { GROUNDING_TOKEN, estimateExposure, seededJitter, sleep, toolInvocation } from './tools';
 
@@ -324,12 +324,9 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
     if (grounding.approved) {
       const orderId = grounding.checks.find((c) => c.param === 'ORDER_ID')?.value ?? '';
       const sku = grounding.checks.find((c) => c.param === 'ITEM_SKU')?.value ?? '';
-      const order = findOrder(orderId);
+      const order = resolveOrder(orderId, sku);
 
-      if (!order) {
-        grounding = markGroundingMissing(grounding, 'ORDER_ID');
-        validationNote = `I couldn't find an order matching **#${orderId}** — could you double-check the number?`;
-      } else if (!order.items.some((item) => item.sku.toUpperCase() === sku.toUpperCase())) {
+      if (!order.items.some((item) => item.sku.toUpperCase() === sku.toUpperCase())) {
         grounding = markGroundingMissing(grounding, 'ITEM_SKU');
         validationNote = `I found order **#${orderId}**, but I couldn't match **${sku}** to the items on it.`;
       }
@@ -484,7 +481,10 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
       { data: { label: decision.label, confidence: decision.confidence } },
     );
     await runGroundedTurn();
-  } else if (decision.label === 'HUMAN_ESCALATION' || isLowConfidence(decision)) {
+  } else if (
+    decision.label === 'HUMAN_ESCALATION' ||
+    (isLowConfidence(decision) && decision.label !== 'SAFE_INFO_REQUEST')
+  ) {
     /* ---------- HUMAN ESCALATION ---------- */
     if (isLowConfidence(decision) && decision.label !== 'HUMAN_ESCALATION') {
       emit(
@@ -518,6 +518,17 @@ export async function processTurn(input: TurnInput): Promise<{ trace: PipelineTr
     /* ---------- SAFE INFO REQUEST (fast path) ---------- */
     guardrail = 'GREEN';
     action = 'PROCEED_TO_MAIN_AGENT';
+    if (isLowConfidence(decision)) {
+      emit(
+        1,
+        'LOW_CONFIDENCE',
+        'guard',
+        'info',
+        'Low-confidence classification',
+        `Confidence ${(decision.confidence * 100).toFixed(1)}% — using the read-only support fallback (no money-moving tools)`,
+        { data: { confidence: decision.confidence, threshold: 0.5, fallback: 'SAFE_INFO_REQUEST' } },
+      );
+    }
     const outcome = await runMainAgent({
       label: 'SAFE_INFO_REQUEST',
       userMessage: input.message,

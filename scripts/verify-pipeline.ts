@@ -185,6 +185,32 @@ async function continuityChecks() {
     ['action CLARIFY_GROUNDING', step2.trace.action === 'CLARIFY_GROUNDING'],
     ['not escalated', step2.trace.action !== 'ESCALATED_TO_HUMAN'],
   ]);
+
+  // 7) Arbitrary demo data: the ledger only seeds a handful of orders, but
+  //    the agent must still handle any order id / SKU the tester supplies.
+  const dummyStart = await turn('i need refund for my product 12345 as it was broken', []);
+  const dummyDone = await turn('the product was shoes', dummyStart.history);
+  const dummyRefund = dummyDone.trace.tools.find((t) => t.name === 'execute_refund');
+  report('dummy order id plus product words completes the refund', [
+    ['dummy order accepted', /#?12345/.test(JSON.stringify(dummyRefund?.args ?? {}))],
+    ['product word resolved to a SKU', /SHOE-BLU-01/.test(JSON.stringify(dummyRefund?.args ?? {}))],
+    ['refund executed', dummyRefund?.status === 'executed'],
+  ]);
+
+  const arbitrary = await turn('refund order 55555 sku XYZ-999 because defective', []);
+  const arbitraryRefund = arbitrary.trace.tools.find((t) => t.name === 'execute_refund');
+  report('arbitrary order id and SKU are accepted as demo data', [
+    ['arbitrary order accepted', /55555/.test(JSON.stringify(arbitraryRefund?.args ?? {}))],
+    ['arbitrary SKU accepted', /XYZ-999/.test(JSON.stringify(arbitraryRefund?.args ?? {}))],
+    ['refund executed', arbitraryRefund?.status === 'executed'],
+  ]);
+
+  // 8) Unrecognised chat should get a helpful fallback, not a human ticket.
+  const smallTalk = await turn('hello, what can you do?', []);
+  report('general chat gets a helpful fallback', [
+    ['not escalated', smallTalk.trace.action !== 'ESCALATED_TO_HUMAN'],
+    ['explains capabilities', /order tracking/i.test(smallTalk.trace.assistantMessage)],
+  ]);
 }
 
 function report(title: string, checks: Array<[string, boolean]>) {

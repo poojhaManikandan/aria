@@ -113,6 +113,30 @@ function composeRefundAnswer(
   );
 }
 
+function composeGeneralAnswer(userMessage: string): string {
+  const lower = userMessage.toLowerCase().trim();
+
+  if (/^(hi|hello|hey|yo|good (morning|afternoon|evening))\b/.test(lower)) {
+    return (
+      `Hi! I can help with order tracking, refunds, returns and product questions. ` +
+      `Share an order number (for example #99482) or tell me what you need.`
+    );
+  }
+
+  if (/(what can you do|how can you help|what do you do|who are you|help me)/.test(lower)) {
+    return (
+      `I can look up orders, explain shipping status, start a return or refund, and answer product questions. ` +
+      `If you have an order number, share it and I'll pull up the details. If not, describe the issue and I'll guide you.`
+    );
+  }
+
+  return (
+    `Happy to help! Could you share the order number (it usually looks like #99482), ` +
+    `or describe the issue you're seeing? For example: "where is my order #99482" or ` +
+    `"refund order #12345 because it arrived damaged".`
+  );
+}
+
 function composeEscalationAnswer(ticket: { ticketId: string; queue: string; eta: string }) {
   return (
     `I've escalated this to a senior agent — you're in the right hands.\n\n` +
@@ -169,44 +193,44 @@ export async function runMainAgent(ctx: MainAgentContext): Promise<MainAgentOutc
   if (ctx.label === 'SAFE_INFO_REQUEST') {
     /* ------------------- read-only lookup route ------------------- */
     const orderId = extractOrderId(ctx.userMessage);
-    const toolStart = Date.now();
-    const order = orderId ? await lookupOrder(orderId) : null;
-    const toolLatency = Date.now() - toolStart;
 
-    tools.push(
-      toolInvocation(
-        'lookup_order',
-        orderId ? { order_id: orderId } : { order_id: null },
-        orderId ? 'executed' : 'skipped',
-        toolLatency,
-        order ? { status: order.status, carrier: order.carrier, eta: order.eta } : null,
-      ),
-    );
+    if (orderId) {
+      const toolStart = Date.now();
+      const order = await lookupOrder(orderId);
+      const toolLatency = Date.now() - toolStart;
 
-    ctx.emit({
-      layer: 3,
-      stage: 'TOOL_CALL',
-      kind: 'tool',
-      level: 'success',
-      title: 'Tool · lookup_order',
-      message: orderId
-        ? `read-only lookup on #${orderId}`
-        : 'no order reference detected — asking the customer for it',
-      durationMs: toolLatency,
-      data: { tool: 'lookup_order', args: { order_id: orderId }, readOnly: true },
-    });
+      tools.push(
+        toolInvocation(
+          'lookup_order',
+          { order_id: orderId },
+          'executed',
+          toolLatency,
+          order ? { status: order.status, carrier: order.carrier, eta: order.eta } : null,
+        ),
+      );
 
-    message = orderId
-      ? composeOrderStatusAnswer(orderId, order)
-      : `Happy to help! Could you share the order number you placed with (it looks like #99482)? ` +
-        `I'll pull up its live status straight away.`;
+      ctx.emit({
+        layer: 3,
+        stage: 'TOOL_CALL',
+        kind: 'tool',
+        level: 'success',
+        title: 'Tool · lookup_order',
+        message: `read-only lookup on #${orderId}`,
+        durationMs: toolLatency,
+        data: { tool: 'lookup_order', args: { order_id: orderId }, readOnly: true },
+      });
+
+      message = composeOrderStatusAnswer(orderId, order);
+    } else {
+      message = composeGeneralAnswer(ctx.userMessage);
+    }
   } else if (ctx.label === 'VALID_RETURN_REQUEST') {
     /* --------------------- refund route --------------------------- */
     const orderId = ctx.grounding.checks.find((c) => c.param === 'ORDER_ID')?.value ?? '';
     const sku = ctx.grounding.checks.find((c) => c.param === 'ITEM_SKU')?.value ?? '';
     const reason = ctx.grounding.checks.find((c) => c.param === 'REASON')?.value ?? 'customer request';
     const lookupStart = Date.now();
-    const order = await lookupOrder(orderId);
+    const order = await lookupOrder(orderId, sku);
     const lookupLatency = Date.now() - lookupStart;
 
     if (!order) {
